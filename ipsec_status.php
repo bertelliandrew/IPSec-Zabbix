@@ -1,5 +1,19 @@
 <?php
 
+/*
+ * Monitora IPsec no pfSense.
+ *
+ * Para cada Phase 2 habilitada:
+ * - valida se existe SA ativa
+ * - lê o Automatically ping host
+ * - testa ping LAN-to-LAN
+ *
+ * final_status:
+ * 1 = IPsec UP e comunicação OK
+ * 0 = IPsec DOWN ou sem comunicação
+ * 2 = falta configuração para testar
+ */
+
 require_once("/etc/inc/globals.inc");
 require_once("/etc/inc/functions.inc");
 require_once("/etc/inc/config.inc");
@@ -9,6 +23,9 @@ require_once("ipsec.inc");
 $result = new stdClass();
 $result->data = array();
 
+/*
+ * Lê a configuração do pfSense com compatibilidade entre versões.
+ */
 function getConfigPathCompat($path, $default = array()) {
     global $config;
 
@@ -30,6 +47,9 @@ function getConfigPathCompat($path, $default = array()) {
     return $current;
 }
 
+/*
+ * Garante que Phase 1/Phase 2 sejam tratadas como lista.
+ */
 function ensureList($value) {
     if (!is_array($value)) {
         return array();
@@ -52,6 +72,10 @@ function ensureList($value) {
     return $value;
 }
 
+/*
+ * Converte IP + máscara para CIDR.
+ * Ex: 10.255.255.1/24 -> 10.255.255.0/24
+ */
 function normalizeCidr($ip, $bits) {
     if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
         return "";
@@ -74,6 +98,9 @@ function normalizeCidr($ip, $bits) {
     return long2ip($network) . "/" . $bits;
 }
 
+/*
+ * Quebra uma rede CIDR em IP e máscara.
+ */
 function parseCidr($cidr) {
     $parts = explode("/", $cidr);
 
@@ -98,6 +125,9 @@ function parseCidr($cidr) {
     );
 }
 
+/*
+ * Verifica se um IP pertence a uma rede CIDR.
+ */
 function ipInCidr($ip, $cidr) {
     $parsed = parseCidr($cidr);
 
@@ -122,6 +152,9 @@ function ipInCidr($ip, $cidr) {
     return (($ipLong & $mask) == ($networkLong & $mask));
 }
 
+/*
+ * Descobre a rede CIDR de uma interface do pfSense.
+ */
 function getInterfaceCidr($ifName) {
     $ifName = strtolower((string)$ifName);
 
@@ -147,6 +180,9 @@ function getInterfaceCidr($ifName) {
     return "";
 }
 
+/*
+ * Converte Local/Remote Network da Phase 2 para CIDR.
+ */
 function getCidrFromIpsecId($id) {
     if (!is_array($id)) {
         return "";
@@ -187,6 +223,9 @@ function getCidrFromIpsecId($id) {
     return "";
 }
 
+/*
+ * Encontra o IP local do pfSense dentro da rede local da Phase 2.
+ */
 function findLocalSourceIpForCidr($localCidr) {
     $interfaces = getConfigPathCompat("interfaces", array());
 
@@ -217,6 +256,9 @@ function findLocalSourceIpForCidr($localCidr) {
     return "";
 }
 
+/*
+ * Carrega as Phase 1 habilitadas e indexa por ikeid.
+ */
 function getPhase1Map() {
     $phase1Raw = getConfigPathCompat("ipsec/phase1", array());
     $phase1List = ensureList($phase1Raw);
@@ -243,6 +285,10 @@ function getPhase1Map() {
     return $map;
 }
 
+/*
+ * Descobre todas as Phase 2 habilitadas.
+ * Cada Phase 2 vira uma entrada no JSON.
+ */
 function getIpsecPhase2Entries() {
     $entries = array();
 
@@ -323,6 +369,9 @@ function getIpsecPhase2Entries() {
     return $entries;
 }
 
+/*
+ * Lê as SAs ativas do IPsec.
+ */
 function getActiveIpsecSas() {
     if (!function_exists("ipsec_list_sa")) {
         return array();
@@ -337,6 +386,9 @@ function getActiveIpsecSas() {
     return $sas;
 }
 
+/*
+ * Valida se a Phase 1/Phase 2 estão tecnicamente UP.
+ */
 function getIpsecSaStatus($conid, $sas) {
     foreach ($sas as $ikesa) {
         if (!isset($ikesa["con-id"])) {
@@ -382,6 +434,11 @@ function getIpsecSaStatus($conid, $sas) {
     );
 }
 
+/*
+ * Faz ping LAN-to-LAN usando:
+ * source = IP local da Phase 2
+ * target = Automatically ping host
+ */
 function probeLanToLan($source, $target, $remoteNetwork) {
     if ($target == "") {
         return array(
@@ -437,6 +494,9 @@ function probeLanToLan($source, $target, $remoteNetwork) {
     );
 }
 
+/*
+ * Execução principal.
+ */
 $entries = getIpsecPhase2Entries();
 $sas = getActiveIpsecSas();
 
