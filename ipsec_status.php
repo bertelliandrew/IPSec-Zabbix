@@ -1,28 +1,32 @@
 <?php
 
 /*
- * Monitora túneis IPsec no pfSense.
+ * pfSense IPsec Monitor for Zabbix
  *
- * Para cada Phase 2 habilitada:
- * - verifica se a SA do IPsec está ativa;
- * - lê o "Automatically ping host" da Phase 2;
- * - testa comunicação LAN-to-LAN usando ping com source correto.
+ * This script monitors pfSense IPsec tunnels by separating:
  *
- * Campos principais do JSON:
+ * - Phase 1 status:
+ *   Checks if the IKE SA is established.
  *
- * ipsec_status:
- * 1 = IPsec/SA UP
- * 0 = IPsec/SA DOWN
+ * - Phase 2 status:
+ *   Checks if LAN-to-LAN communication is really working by pinging
+ *   the "Automatically ping host" configured in each Phase 2.
  *
- * lan_ping_status:
- * 1 = ping LAN-to-LAN UP
- * 0 = ping LAN-to-LAN DOWN
- * 2 = falta configuração para testar
+ * The goal is to avoid false positives where IPsec appears online,
+ * but traffic between LANs is not working.
  *
- * status:
- * 1 = IPsec UP e ping LAN-to-LAN UP
- * 0 = IPsec DOWN ou ping LAN-to-LAN DOWN
- * 2 = falta configuração para testar
+ * JSON output:
+ *
+ * {
+ *   "phase1": [],
+ *   "phase2": []
+ * }
+ *
+ * Status codes:
+ *
+ * 1 = UP
+ * 0 = DOWN
+ * 2 = configuration problem / not monitorable
  */
 
 require_once("/etc/inc/globals.inc");
@@ -31,9 +35,21 @@ require_once("/etc/inc/config.inc");
 require_once("interfaces.inc");
 require_once("ipsec.inc");
 
-$SCRIPT_START = microtime(true);
+/*
+ * Performance settings.
+ *
+ * Pings are executed in parallel.
+ * The timeout prevents the script from getting stuck on unreachable peers.
+ */
 $PING_TIMEOUT_SECONDS = 2.0;
 $PING_CONCURRENCY_LIMIT = 20;
+
+/*
+ * Optional cache.
+ *
+ * Keep disabled by default for Zabbix accuracy.
+ * Set CACHE_TTL_SECONDS to 10 or 15 if the item is queried too frequently.
+ */
 $CACHE_TTL_SECONDS = 0;
 $CACHE_FILE = "/tmp/pfsense_ipsec_status_cache.json";
 
@@ -47,8 +63,12 @@ if (
 }
 
 $result = new stdClass();
-$result->data = array();
+$result->phase1 = array();
+$result->phase2 = array();
 
+/*
+ * Reads pfSense configuration paths with compatibility between versions.
+ */
 function getConfigPathCompat($path, $default = array()) {
     global $config;
 
@@ -70,6 +90,9 @@ function getConfigPathCompat($path, $default = array()) {
     return $current;
 }
 
+/*
+ * Ensures pfSense config entries are always treated as a list.
+ */
 function ensureList($value) {
     if (!is_array($value)) {
         return array();
@@ -92,6 +115,9 @@ function ensureList($value) {
     return $value;
 }
 
+/*
+ * Converts IPv4 to unsigned integer.
+ */
 function ipToLongUnsigned($ip) {
     $long = ip2long($ip);
 
@@ -102,6 +128,12 @@ function ipToLongUnsigned($ip) {
     return (int)sprintf("%u", $long);
 }
 
+/*
+ * Converts IP + mask bits to CIDR network.
+ *
+ * Example:
+ * 10.255.255.1/24 -> 10.255.255.0/24
+ */
 function normalizeCidr($ip, $bits) {
     if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
         return "";
@@ -129,6 +161,9 @@ function normalizeCidr($ip, $bits) {
     return long2ip($network) . "/" . $bits;
 }
 
+/*
+ * Parses a CIDR network.
+ */
 function parseCidr($cidr) {
     $parts = explode("/", $cidr);
 
@@ -153,6 +188,9 @@ function parseCidr($cidr) {
     );
 }
 
+/*
+ * Checks if an IP belongs to a CIDR network.
+ */
 function ipInCidr($ip, $cidr) {
     $parsed = parseCidr($cidr);
 
@@ -182,6 +220,9 @@ function ipInCidr($ip, $cidr) {
     return (($ipLong & $mask) === ($networkLong & $mask));
 }
 
+/*
+ * Gets CIDR network from a pfSense interface.
+ */
 function getInterfaceCidr($ifName) {
     $ifName = strtolower((string)$ifName);
 
@@ -207,6 +248,9 @@ function getInterfaceCidr($ifName) {
     return "";
 }
 
+/*
+ * Loads all local IPv4 interface addresses once.
+ */
 function getLocalInterfaceIps() {
     $interfaces = getConfigPathCompat("interfaces", array());
     $localIps = array();
@@ -241,6 +285,9 @@ function getLocalInterfaceIps() {
     return $localIps;
 }
 
+/*
+ * Converts Phase 2 localid/remoteid to CIDR.
+ */
 function getCidrFromIpsecId($id) {
     if (!is_array($id)) {
         return "";
@@ -281,6 +328,10 @@ function getCidrFromIpsecId($id) {
     return "";
 }
 
+/*
+ * Finds the local pfSense IP that belongs to the Phase 2 local network.
+ * This IP is used as the ping source.
+ */
 function findLocalSourceIpForCidr($localCidr, $localIps) {
     if ($localCidr === "" || $localCidr === "0.0.0.0/0") {
         return "";
@@ -295,6 +346,9 @@ function findLocalSourceIpForCidr($localCidr, $localIps) {
     return "";
 }
 
+/*
+ * Loads enabled Phase 1 entries and indexes them by ikeid.
+ */
 function getPhase1Map() {
     $phase1Raw = getConfigPathCompat("ipsec/phase1", array());
     $phase1List = ensureList($phase1Raw);
@@ -321,6 +375,9 @@ function getPhase1Map() {
     return $map;
 }
 
+/*
+ * Discovers all enabled Phase 2 entries.
+ */
 function getIpsecPhase2Entries() {
     $entries = array();
 
@@ -373,6 +430,10 @@ function getIpsecPhase2Entries() {
             ? getCidrFromIpsecId($p2["remoteid"])
             : "";
 
+        /*
+         * pinghost comes from:
+         * Phase 2 > Keep Alive > Automatically ping host
+         */
         $pingHost = isset($p2["pinghost"])
             ? trim((string)$p2["pinghost"])
             : "";
@@ -401,6 +462,9 @@ function getIpsecPhase2Entries() {
     return $entries;
 }
 
+/*
+ * Reads active IPsec SAs from pfSense/strongSwan.
+ */
 function getActiveIpsecSas() {
     if (!function_exists("ipsec_list_sa")) {
         return array();
@@ -415,6 +479,9 @@ function getActiveIpsecSas() {
     return $sas;
 }
 
+/*
+ * Indexes SAs by con-id.
+ */
 function buildSaMapByConid($sas) {
     $map = array();
 
@@ -427,11 +494,17 @@ function buildSaMapByConid($sas) {
     return $map;
 }
 
-function getIpsecSaStatus($entry, $saMap) {
-    $conid = (string)$entry["conid"];
+/*
+ * Checks Phase 1/IKE status.
+ */
+function getPhase1Status($conid, $saMap) {
+    $conid = (string)$conid;
 
     if (!isset($saMap[$conid])) {
-        return array("status" => 0, "status_text" => "DOWN");
+        return array(
+            "status" => 0,
+            "status_text" => "DOWN"
+        );
     }
 
     $ikesa = $saMap[$conid];
@@ -440,43 +513,67 @@ function getIpsecSaStatus($entry, $saMap) {
         ? strtoupper((string)$ikesa["state"])
         : "";
 
-    $childCount = 0;
-
-    if (isset($ikesa["child-sas"]) && is_array($ikesa["child-sas"])) {
-        $childCount = count($ikesa["child-sas"]);
+    if ($state === "ESTABLISHED") {
+        return array(
+            "status" => 1,
+            "status_text" => "UP"
+        );
     }
 
-    if ($state === "ESTABLISHED" && $childCount > 0) {
-        return array("status" => 1, "status_text" => "UP");
-    }
-
-    return array("status" => 0, "status_text" => "DOWN");
+    return array(
+        "status" => 0,
+        "status_text" => "DOWN"
+    );
 }
 
+/*
+ * Validates probe configuration before running ping.
+ */
 function validateProbeConfig($source, $target, $remoteNetwork) {
     if ($target === "") {
-        return array("status" => 2, "status_text" => "NO_PINGHOST_CONFIGURED");
+        return array(
+            "status" => 2,
+            "status_text" => "NO_PINGHOST_CONFIGURED"
+        );
     }
 
     if ($source === "") {
-        return array("status" => 2, "status_text" => "NO_LOCAL_SOURCE_IP");
+        return array(
+            "status" => 2,
+            "status_text" => "NO_LOCAL_SOURCE_IP"
+        );
     }
 
     if (!filter_var($source, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-        return array("status" => 2, "status_text" => "INVALID_SOURCE_IP");
+        return array(
+            "status" => 2,
+            "status_text" => "INVALID_SOURCE_IP"
+        );
     }
 
     if (!filter_var($target, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-        return array("status" => 2, "status_text" => "INVALID_PINGHOST");
+        return array(
+            "status" => 2,
+            "status_text" => "INVALID_PINGHOST"
+        );
     }
 
     if ($remoteNetwork !== "" && !ipInCidr($target, $remoteNetwork)) {
-        return array("status" => 2, "status_text" => "PINGHOST_OUTSIDE_REMOTE_NETWORK");
+        return array(
+            "status" => 2,
+            "status_text" => "PINGHOST_OUTSIDE_REMOTE_NETWORK"
+        );
     }
 
-    return array("status" => 9, "status_text" => "READY");
+    return array(
+        "status" => 9,
+        "status_text" => "READY"
+    );
 }
 
+/*
+ * Starts one non-blocking ping process.
+ */
 function startPingProcess($source, $target) {
     $cmd = "exec /sbin/ping -S " . escapeshellarg($source) .
            " -c 1 -o -q " . escapeshellarg($target);
@@ -513,6 +610,9 @@ function startPingProcess($source, $target) {
     );
 }
 
+/*
+ * Closes or terminates a ping process.
+ */
 function closePingProcess($procData, $terminate = false) {
     $process = $procData["process"];
     $pipes = $procData["pipes"];
@@ -539,6 +639,9 @@ function closePingProcess($procData, $terminate = false) {
     return proc_close($process);
 }
 
+/*
+ * Runs ping probes in parallel.
+ */
 function runPingJobs($jobs, $timeoutSeconds, $limit) {
     $results = array();
     $pending = $jobs;
@@ -554,7 +657,10 @@ function runPingJobs($jobs, $timeoutSeconds, $limit) {
             $procData = startPingProcess($job["source"], $job["target"]);
 
             if ($procData === false) {
-                $results[$key] = array("status" => 2, "status_text" => "PROBE_START_FAILED");
+                $results[$key] = array(
+                    "status" => 2,
+                    "status_text" => "PROBE_START_FAILED"
+                );
                 continue;
             }
 
@@ -584,7 +690,12 @@ function runPingJobs($jobs, $timeoutSeconds, $limit) {
 
             if ($elapsed >= $timeoutSeconds) {
                 closePingProcess($procData, true);
-                $results[$key] = array("status" => 0, "status_text" => "TIMEOUT");
+
+                $results[$key] = array(
+                    "status" => 0,
+                    "status_text" => "TIMEOUT"
+                );
+
                 unset($active[$key]);
             }
         }
@@ -597,33 +708,65 @@ function runPingJobs($jobs, $timeoutSeconds, $limit) {
     return $results;
 }
 
+/*
+ * Main execution.
+ */
 $entries = getIpsecPhase2Entries();
 $localIps = getLocalInterfaceIps();
 $sas = getActiveIpsecSas();
 $saMap = buildSaMapByConid($sas);
+
+$phase1Rows = array();
 $rows = array();
 $jobs = array();
 
 foreach ($entries as $idx => $entry) {
     $sourceIp = findLocalSourceIpForCidr($entry["local_network"], $localIps);
     $targetIp = $entry["pinghost"];
-    $saStatus = getIpsecSaStatus($entry, $saMap);
+
+    $conid = (string)$entry["conid"];
+    $p1Key = $entry["p1_name"] . "|" . $conid;
+
+    $p1Status = getPhase1Status($conid, $saMap);
+
+    if (!isset($phase1Rows[$p1Key])) {
+        $phase1Rows[$p1Key] = array(
+            "key" => $p1Key,
+            "name" => $entry["p1_name"],
+            "ipsec_status" => $p1Status["status"],
+            "ipsec_status_text" => $p1Status["status_text"],
+            "status" => $p1Status["status"],
+            "status_text" => $p1Status["status_text"]
+        );
+    }
+
     $probePrecheck = validateProbeConfig($sourceIp, $targetIp, $entry["remote_network"]);
 
-    if ($saStatus["status"] !== 1) {
-        $probeStatus = array("status" => 0, "status_text" => "SKIPPED_IPSEC_DOWN");
+    if ($p1Status["status"] !== 1) {
+        $probeStatus = array(
+            "status" => 0,
+            "status_text" => "SKIPPED_PHASE1_DOWN"
+        );
     } elseif ($probePrecheck["status"] !== 9) {
         $probeStatus = $probePrecheck;
     } else {
-        $probeStatus = array("status" => 9, "status_text" => "PENDING");
-        $jobs[$idx] = array("source" => $sourceIp, "target" => $targetIp);
+        $probeStatus = array(
+            "status" => 9,
+            "status_text" => "PENDING"
+        );
+
+        $jobs[$idx] = array(
+            "source" => $sourceIp,
+            "target" => $targetIp
+        );
     }
 
     $rows[$idx] = array(
         "entry" => $entry,
+        "p1_key" => $p1Key,
         "source" => $sourceIp,
         "target" => $targetIp,
-        "sa" => $saStatus,
+        "p1_status" => $p1Status,
         "probe" => $probeStatus
     );
 }
@@ -636,12 +779,16 @@ foreach ($jobResults as $idx => $probeResult) {
     }
 }
 
+foreach ($phase1Rows as $phase1Row) {
+    $result->phase1[] = $phase1Row;
+}
+
 foreach ($rows as $row) {
     $entry = $row["entry"];
-    $saStatus = $row["sa"];
+    $p1Status = $row["p1_status"];
     $probeStatus = $row["probe"];
 
-    if ($saStatus["status"] === 1 && $probeStatus["status"] === 1) {
+    if ($p1Status["status"] === 1 && $probeStatus["status"] === 1) {
         $finalStatus = 1;
         $finalStatusText = "UP";
     } elseif ($probeStatus["status"] === 2) {
@@ -658,7 +805,7 @@ foreach ($rows as $row) {
         $name = $entry["p1_name"] . " / " . $entry["p2_name"];
     }
 
-    $key = $entry["p1_name"] . "|" .
+    $key = $row["p1_key"] . "|" .
            $entry["p2_name"] . "|" .
            $entry["local_network"] . "|" .
            $entry["remote_network"];
@@ -669,14 +816,15 @@ foreach ($rows as $row) {
         $probe = $row["source"] . " -> " . $row["target"];
     }
 
-    $result->data[] = array(
+    $result->phase2[] = array(
+        "p1_key" => $row["p1_key"],
         "key" => $key,
         "name" => $name,
         "local" => $entry["local_network"],
         "remote" => $entry["remote_network"],
         "probe" => $probe,
-        "ipsec_status" => $saStatus["status"],
-        "ipsec_status_text" => $saStatus["status_text"],
+        "ipsec_status" => $p1Status["status"],
+        "ipsec_status_text" => $p1Status["status_text"],
         "lan_ping_status" => $probeStatus["status"],
         "lan_ping_status_text" => $probeStatus["status_text"],
         "status" => $finalStatus,
@@ -684,6 +832,9 @@ foreach ($rows as $row) {
     );
 }
 
+/*
+ * JSON output.
+ */
 $jsonFlags = JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES;
 
 if (defined("JSON_INVALID_UTF8_SUBSTITUTE")) {
