@@ -1,32 +1,30 @@
 <?php
 
 /*
- * pfSense IPsec Monitor for Zabbix
- *
- * This script monitors pfSense IPsec tunnels by separating:
- *
- * - Phase 1 status:
- *   Checks if the IKE SA is established.
- *
- * - Phase 2 status:
- *   Checks if LAN-to-LAN communication is really working by pinging
- *   the "Automatically ping host" configured in each Phase 2.
- *
- * The goal is to avoid false positives where IPsec appears online,
- * but traffic between LANs is not working.
- *
- * JSON output:
- *
- * {
- *   "phase1": [],
- *   "phase2": []
- * }
- *
- * Status codes:
- *
- * 1 = UP
- * 0 = DOWN
- * 2 = configuration problem / not monitorable
+  - Phase 1:
+    Verifica se a IKE SA está estabelecida.
+ 
+  - Phase 2:
+    Verifica se a comunicação LAN-to-LAN realmente funciona,
+    usando ping para o IP configurado em:
+    Phase 2 > Keep Alive > Automatically ping host.
+ 
+  Objetivo:
+  Evitar falso positivo onde o IPsec aparece como UP,
+  mas não existe tráfego real entre as redes.
+ 
+  Saída JSON:
+ 
+  {
+    "phase1": [],
+    "phase2": []
+  }
+ 
+  Códigos de status:
+ 
+  1 = up
+  0 = down
+  2 = problema de configuração / não monitorável
  */
 
 require_once("/etc/inc/globals.inc");
@@ -36,19 +34,19 @@ require_once("interfaces.inc");
 require_once("ipsec.inc");
 
 /*
- * Performance settings.
+ * Configurações de performance.
  *
- * Pings are executed in parallel.
- * The timeout prevents the script from getting stuck on unreachable peers.
+ * Os pings são executados em paralelo.
+ * O timeout evita que o script fique preso aguardando resposta.
  */
 $PING_TIMEOUT_SECONDS = 2.0;
 $PING_CONCURRENCY_LIMIT = 20;
 
 /*
- * Optional cache.
+ * Cache opcional.
  *
- * Keep disabled by default for Zabbix accuracy.
- * Set CACHE_TTL_SECONDS to 10 or 15 if the item is queried too frequently.
+ * Por padrão fica desligado para o Zabbix sempre receber dados atuais.
+ * Se necessário, pode definir 10 ou 15 segundos para reduzir carga.
  */
 $CACHE_TTL_SECONDS = 0;
 $CACHE_FILE = "/tmp/pfsense_ipsec_status_cache.json";
@@ -67,7 +65,7 @@ $result->phase1 = array();
 $result->phase2 = array();
 
 /*
- * Reads pfSense configuration paths with compatibility between versions.
+ * Lê caminhos da configuração do pfSense com compatibilidade entre versões.
  */
 function getConfigPathCompat($path, $default = array()) {
     global $config;
@@ -91,7 +89,7 @@ function getConfigPathCompat($path, $default = array()) {
 }
 
 /*
- * Ensures pfSense config entries are always treated as a list.
+ * Garante que entradas do config.xml sejam tratadas como lista.
  */
 function ensureList($value) {
     if (!is_array($value)) {
@@ -116,7 +114,7 @@ function ensureList($value) {
 }
 
 /*
- * Converts IPv4 to unsigned integer.
+ * Converte IPv4 para inteiro sem sinal.
  */
 function ipToLongUnsigned($ip) {
     $long = ip2long($ip);
@@ -129,9 +127,9 @@ function ipToLongUnsigned($ip) {
 }
 
 /*
- * Converts IP + mask bits to CIDR network.
+ * Converte IP + máscara para rede CIDR.
  *
- * Example:
+ * Exemplo:
  * 10.255.255.1/24 -> 10.255.255.0/24
  */
 function normalizeCidr($ip, $bits) {
@@ -162,7 +160,7 @@ function normalizeCidr($ip, $bits) {
 }
 
 /*
- * Parses a CIDR network.
+ * Quebra uma rede CIDR em IP e máscara.
  */
 function parseCidr($cidr) {
     $parts = explode("/", $cidr);
@@ -189,7 +187,7 @@ function parseCidr($cidr) {
 }
 
 /*
- * Checks if an IP belongs to a CIDR network.
+ * Verifica se um IP pertence a uma rede CIDR.
  */
 function ipInCidr($ip, $cidr) {
     $parsed = parseCidr($cidr);
@@ -221,7 +219,7 @@ function ipInCidr($ip, $cidr) {
 }
 
 /*
- * Gets CIDR network from a pfSense interface.
+ * Descobre a rede CIDR de uma interface do pfSense.
  */
 function getInterfaceCidr($ifName) {
     $ifName = strtolower((string)$ifName);
@@ -249,7 +247,7 @@ function getInterfaceCidr($ifName) {
 }
 
 /*
- * Loads all local IPv4 interface addresses once.
+ * Carrega todos os IPs IPv4 locais das interfaces uma única vez.
  */
 function getLocalInterfaceIps() {
     $interfaces = getConfigPathCompat("interfaces", array());
@@ -286,7 +284,7 @@ function getLocalInterfaceIps() {
 }
 
 /*
- * Converts Phase 2 localid/remoteid to CIDR.
+ * Converte localid/remoteid da Phase 2 para CIDR.
  */
 function getCidrFromIpsecId($id) {
     if (!is_array($id)) {
@@ -329,8 +327,8 @@ function getCidrFromIpsecId($id) {
 }
 
 /*
- * Finds the local pfSense IP that belongs to the Phase 2 local network.
- * This IP is used as the ping source.
+ * Encontra o IP local do pfSense dentro da rede local da Phase 2.
+ * Esse IP será usado como origem do ping.
  */
 function findLocalSourceIpForCidr($localCidr, $localIps) {
     if ($localCidr === "" || $localCidr === "0.0.0.0/0") {
@@ -347,7 +345,7 @@ function findLocalSourceIpForCidr($localCidr, $localIps) {
 }
 
 /*
- * Loads enabled Phase 1 entries and indexes them by ikeid.
+ * Carrega as Phase 1 habilitadas e indexa por ikeid.
  */
 function getPhase1Map() {
     $phase1Raw = getConfigPathCompat("ipsec/phase1", array());
@@ -376,7 +374,7 @@ function getPhase1Map() {
 }
 
 /*
- * Discovers all enabled Phase 2 entries.
+ * Descobre todas as Phase 2 habilitadas.
  */
 function getIpsecPhase2Entries() {
     $entries = array();
@@ -431,7 +429,7 @@ function getIpsecPhase2Entries() {
             : "";
 
         /*
-         * pinghost comes from:
+         * O pinghost vem do campo:
          * Phase 2 > Keep Alive > Automatically ping host
          */
         $pingHost = isset($p2["pinghost"])
@@ -463,7 +461,7 @@ function getIpsecPhase2Entries() {
 }
 
 /*
- * Reads active IPsec SAs from pfSense/strongSwan.
+ * Lê as SAs ativas do IPsec no pfSense/strongSwan.
  */
 function getActiveIpsecSas() {
     if (!function_exists("ipsec_list_sa")) {
@@ -480,7 +478,7 @@ function getActiveIpsecSas() {
 }
 
 /*
- * Indexes SAs by con-id.
+ * Indexa as SAs pelo con-id.
  */
 function buildSaMapByConid($sas) {
     $map = array();
@@ -495,7 +493,7 @@ function buildSaMapByConid($sas) {
 }
 
 /*
- * Checks Phase 1/IKE status.
+ * Verifica o status da Phase 1 / IKE.
  */
 function getPhase1Status($conid, $saMap) {
     $conid = (string)$conid;
@@ -527,7 +525,7 @@ function getPhase1Status($conid, $saMap) {
 }
 
 /*
- * Validates probe configuration before running ping.
+ * Valida se o teste de ping pode ser executado.
  */
 function validateProbeConfig($source, $target, $remoteNetwork) {
     if ($target === "") {
@@ -572,7 +570,7 @@ function validateProbeConfig($source, $target, $remoteNetwork) {
 }
 
 /*
- * Starts one non-blocking ping process.
+ * Inicia um processo de ping sem bloquear o script.
  */
 function startPingProcess($source, $target) {
     $cmd = "exec /sbin/ping -S " . escapeshellarg($source) .
@@ -611,7 +609,7 @@ function startPingProcess($source, $target) {
 }
 
 /*
- * Closes or terminates a ping process.
+ * Fecha ou encerra um processo de ping.
  */
 function closePingProcess($procData, $terminate = false) {
     $process = $procData["process"];
@@ -640,7 +638,7 @@ function closePingProcess($procData, $terminate = false) {
 }
 
 /*
- * Runs ping probes in parallel.
+ * Executa os pings em paralelo.
  */
 function runPingJobs($jobs, $timeoutSeconds, $limit) {
     $results = array();
@@ -709,7 +707,7 @@ function runPingJobs($jobs, $timeoutSeconds, $limit) {
 }
 
 /*
- * Main execution.
+ * Execução principal.
  */
 $entries = getIpsecPhase2Entries();
 $localIps = getLocalInterfaceIps();
@@ -833,7 +831,7 @@ foreach ($rows as $row) {
 }
 
 /*
- * JSON output.
+ * Geração da saída JSON.
  */
 $jsonFlags = JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES;
 
